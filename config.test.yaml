@@ -1,0 +1,4 @@
+clients_file: /mnt/restic_tui/clients
+restic_password: "abc123"
+restore_dir: /mnt/restic_tui/restores
+delete_batch_size: 50

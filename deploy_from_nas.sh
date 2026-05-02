@@ -22,8 +22,8 @@ scp "$NAS:$SRC/restic_wrapper.py" "$DEST/"
 scp "$NAS:$SRC/app.py" "$DEST/"
 
 echo "Pulling config and clients..."
-scp "$NAS:$CONF/config.yaml" "$CONF/"
-scp "$NAS:$CONF/clients" "$CONF/"
+[ -f "$CONF/config.yaml" ] && echo "  config.yaml exists, skipping." || scp "$NAS:$CONF/config.yaml" "$CONF/"
+[ -f "$CONF/clients" ] && echo "  clients exists, skipping." || scp "$NAS:$CONF/clients" "$CONF/"
 
 echo "Updating docker-compose mounts for backup server..."
 cat > "$DEST/docker-compose.yaml" << 'EOF'

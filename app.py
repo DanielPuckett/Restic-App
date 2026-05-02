@@ -1,5 +1,6 @@
 """Restic Backup Manager TUI."""
 import asyncio
+import subprocess
 import yaml
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -69,12 +70,15 @@ class OutputScreen(ModalScreen):
 # ── Restore options screen ───────────────────────────────────────────────────
 
 class RestoreScreen(ModalScreen):
-    def __init__(self, repo_path: str, password: str, snapshot_id: str, item_path: str | None) -> None:
+    REMOTE_PATH = "/mnt/restic.restore"
+
+    def __init__(self, repo_path: str, password: str, snapshot_id: str, item_path: str | None, machine: restic.Machine | None) -> None:
         super().__init__()
         self.repo_path = repo_path
         self.password = password
         self.snapshot_id = snapshot_id
-        self.item_path = item_path  # None = full snapshot
+        self.item_path = item_path
+        self.machine = machine
 
     def compose(self) -> ComposeResult:
         what = self.item_path or "Full snapshot"
@@ -82,20 +86,172 @@ class RestoreScreen(ModalScreen):
             yield Label(f"Restore: {what}", id="re-title")
             yield Label("Target directory:")
             yield Input(value="/mnt/restic_tui/restores", id="target")
+            yield Label("Overwrite policy:")
+            yield Select(
+                [("always (default)", "always"), ("if-changed", "if-changed"), ("if-newer", "if-newer"), ("never", "never")],
+                value="always", id="overwrite",
+            )
+            yield Label("Options:")
+            yield Select(
+                [("none", "none"), ("dry-run (preview only)", "dry-run")],
+                value="none", id="extra-opts",
+            )
             with Horizontal(id="re-buttons"):
-                yield Button("Restore", variant="warning", id="run")
+                yield Button("Local Restore", variant="warning", id="local")
+                if self.machine:
+                    yield Button("Push to Client", variant="error", id="push")
                 yield Button("Cancel", id="cancel")
+
+    def _build_restore_args(self, target: str) -> tuple[list[str], str]:
+        """Build restic restore args. Returns (extra_args, target)."""
+        args = []
+        overwrite = self.query_one("#overwrite", Select).value
+        args.extend(["--overwrite", overwrite])
+        extra = self.query_one("#extra-opts", Select).value
+        if extra == "dry-run":
+            args.append("--dry-run")
+        return args, target
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "cancel":
             self.dismiss()
             return
-        target = self.query_one("#target", Input).value.strip()
-        if not target:
+
+        if event.button.id == "local":
+            target = self.query_one("#target", Input).value.strip()
+            if not target:
+                return
+            extra_args, target = self._build_restore_args(target)
+            output = restic.restore(self.repo_path, self.password, self.snapshot_id, target, self.item_path, extra_args)
+            self.dismiss()
+            self.app.push_screen(OutputScreen("Restore Result", output))
+
+        elif event.button.id == "push":
+            self.dismiss()
+            self.app.push_screen(PushRestoreScreen(
+                self.repo_path, self.password, self.snapshot_id,
+                self.item_path, self.machine,
+                self.query_one("#overwrite", Select).value,
+                self.query_one("#extra-opts", Select).value,
+            ))
+
+
+# ── Push restore screen ──────────────────────────────────────────────────────
+
+class PushRestoreScreen(ModalScreen):
+    BINDINGS = [Binding("escape", "dismiss", "Close")]
+    REMOTE_PATH = "/mnt/restic.restore"
+
+    def __init__(self, repo_path, password, snapshot_id, item_path, machine, overwrite, extra_opt) -> None:
+        super().__init__()
+        self.repo_path = repo_path
+        self.password = password
+        self.snapshot_id = snapshot_id
+        self.item_path = item_path
+        self.machine = machine
+        self.overwrite = overwrite
+        self.extra_opt = extra_opt
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="output-dialog"):
+            yield Label(f"Push restore to {self.machine.name}", id="output-title")
+            yield TextArea("", read_only=True, id="push-log")
+            with Horizontal(id="re-buttons"):
+                yield Button("Proceed", variant="warning", id="proceed", disabled=True)
+                yield Button("Cancel & Unmount", id="cancel-push")
+                yield Button("Close", id="close-push", disabled=True)
+
+    def on_mount(self) -> None:
+        self.run_worker(self._mount_and_check())
+
+    def _log(self, msg: str) -> None:
+        ta = self.query_one("#push-log", TextArea)
+        ta.insert(msg + "\n")
+
+    async def _mount_and_check(self) -> None:
+        if not restic.check_sshfs_installed():
+            self._log("ERROR: sshfs is not installed. Install with: apt-get install sshfs")
+            self.query_one("#close-push", Button).disabled = False
             return
-        output = restic.restore(self.repo_path, self.password, self.snapshot_id, target, self.item_path)
-        self.dismiss()
-        self.app.push_screen(OutputScreen("Restore Result", output))
+
+        self._log(f"⏳ Mounting {self.machine.name}:{self.REMOTE_PATH}...")
+        ok, msg = await asyncio.to_thread(restic.sshfs_mount, self.machine, self.REMOTE_PATH)
+        if not ok:
+            self._log(f"ERROR: {msg}")
+            self.query_one("#close-push", Button).disabled = False
+            return
+        self._log(f"✓ Mounted at {msg}")
+
+        local_mount = f"{restic.REMOTE_MOUNT_BASE}/{self.machine.name}"
+        has_files = await asyncio.to_thread(restic.check_remote_contents, local_mount)
+        if has_files:
+            self._log(f"⚠ Target {self.REMOTE_PATH} on {self.machine.name} has existing files.")
+            self._log(f"  Overwrite policy: {self.overwrite}")
+            self._log("  Press [Proceed] to restore or [Cancel & Unmount] to abort.")
+        else:
+            self._log("✓ Target is empty.")
+            self._log("  Press [Proceed] to restore or [Cancel & Unmount] to abort.")
+
+        self.query_one("#proceed", Button).disabled = False
+
+    async def _do_restore(self) -> None:
+        local_mount = f"{restic.REMOTE_MOUNT_BASE}/{self.machine.name}"
+
+        # Verify mount is still up
+        r = subprocess.run(["mountpoint", "-q", local_mount])
+        if r.returncode != 0:
+            self._log("ERROR: Mount is no longer active. Aborting.")
+            self.query_one("#close-push", Button).disabled = False
+            return
+
+        extra_args = []
+        extra_args.extend(["--overwrite", self.overwrite])
+        if self.extra_opt == "dry-run":
+            extra_args.append("--dry-run")
+
+        self._log(f"⏳ Restoring to {local_mount}...")
+        output = await asyncio.to_thread(
+            restic.restore, self.repo_path, self.password,
+            self.snapshot_id, local_mount, self.item_path, extra_args,
+        )
+        self._log(output)
+
+        self._log(f"⏳ Unmounting {self.machine.name}...")
+        umsg = await asyncio.to_thread(restic.sshfs_unmount, self.machine.name)
+        self._log(f"✓ {umsg}")
+        self._log("\nDone.")
+        # Write full log to file
+        ta = self.query_one("#push-log", TextArea)
+        Path("/mnt/restic_tui/last_output.log").write_text(ta.text)
+        self.query_one("#proceed", Button).disabled = True
+        self.query_one("#cancel-push", Button).disabled = True
+        self.query_one("#close-push", Button).disabled = False
+
+    async def _do_cancel(self) -> None:
+        self._log(f"⏳ Unmounting {self.machine.name}...")
+        umsg = await asyncio.to_thread(restic.sshfs_unmount, self.machine.name)
+        self._log(f"✓ {umsg}")
+        self._log("Cancelled.")
+        ta = self.query_one("#push-log", TextArea)
+        Path("/mnt/restic_tui/last_output.log").write_text(ta.text)
+        self.query_one("#proceed", Button).disabled = True
+        self.query_one("#cancel-push", Button).disabled = True
+        self.query_one("#close-push", Button).disabled = False
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "proceed":
+            self.query_one("#proceed", Button).disabled = True
+            self.query_one("#cancel-push", Button).disabled = True
+            self.run_worker(self._do_restore())
+        elif event.button.id == "cancel-push":
+            self.query_one("#proceed", Button).disabled = True
+            self.query_one("#cancel-push", Button).disabled = True
+            self.run_worker(self._do_cancel())
+        elif event.button.id == "close-push":
+            self.dismiss()
+
+    def action_dismiss(self) -> None:
+        self.app.pop_screen()
 
 
 # ── Detail browser screen ────────────────────────────────────────────────────
@@ -109,11 +265,12 @@ class DetailScreen(ModalScreen):
         Binding("3", "sort_by_3", "Sort:Modified"),
     ]
 
-    def __init__(self, repo_path: str, password: str, snapshot_id: str) -> None:
+    def __init__(self, repo_path: str, password: str, snapshot_id: str, machine: restic.Machine | None = None) -> None:
         super().__init__()
         self.repo_path = repo_path
         self.password = password
         self.snapshot_id = snapshot_id
+        self.machine = machine
         self.nodes: list[restic.Node] = []
         self.sort_key = "default"
 
@@ -218,7 +375,7 @@ class DetailScreen(ModalScreen):
     def action_restore_item(self) -> None:
         path = self._get_selected_path()
         if path:
-            self.app.push_screen(RestoreScreen(self.repo_path, self.password, self.snapshot_id, path))
+            self.app.push_screen(RestoreScreen(self.repo_path, self.password, self.snapshot_id, path, self.machine))
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
@@ -238,7 +395,7 @@ class ResticApp(App):
     #confirm-buttons { height: 3; align: center middle; }
     #output-dialog { width: 80%; height: 80%; border: thick $accent; padding: 1 2; }
     #output-body { height: 1fr; }
-    #re-dialog { width: 70; height: 14; border: thick $accent; padding: 1 2; align: center middle; }
+    #re-dialog { width: 70; height: 22; border: thick $accent; padding: 1 2; align: center middle; }
     #re-buttons { height: 3; align: center middle; }
     #detail-screen { width: 100%; height: 100%; }
     #detail-tree { height: 1fr; }
@@ -291,6 +448,10 @@ class ResticApp(App):
         now = datetime.now(timezone.utc)
         self.query_one("#date-from", Input).value = (now - timedelta(days=30)).strftime("%Y-%m-%d")
         self.query_one("#date-to", Input).value = now.strftime("%Y-%m-%d")
+        # Cleanup stale SSHFS mounts from previous runs
+        stale = restic.cleanup_stale_mounts()
+        if stale:
+            self._status(f"Cleaned up {len(stale)} stale mount(s).")
 
     def _status(self, msg: str) -> None:
         self.query_one("#status-bar", Label).update(msg)
@@ -495,7 +656,7 @@ class ResticApp(App):
         if not self.current_machine:
             return
         password = self.cfg.get("restic_password", "")
-        self.push_screen(DetailScreen(self.current_machine.repo_path, password, sid))
+        self.push_screen(DetailScreen(self.current_machine.repo_path, password, sid, self.current_machine))
 
 
 def main():
