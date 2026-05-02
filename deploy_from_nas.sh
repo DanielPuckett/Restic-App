@@ -33,9 +33,11 @@ services:
     container_name: restic-tui
     stdin_open: true
     tty: true
+    privileged: true
     volumes:
       - /mnt/restic_tui:/mnt/restic_tui
       - /mnt/BACKUPS:/mnt/BACKUPS
+      - /home/user/.ssh:/home/user/.ssh:ro
     environment:
       - TERM=xterm-256color
 EOF
