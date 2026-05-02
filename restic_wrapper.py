@@ -187,12 +187,13 @@ def check_sshfs_installed() -> bool:
     return r.returncode == 0
 
 
-def parse_ssh_string(ssh_cmd: str) -> tuple[str, str | None]:
-    """Extract user@host and identity file from SSH connect string.
-    Strips -R reverse tunnel args. Returns (user@host, identity_file)."""
+def parse_ssh_string(ssh_cmd: str) -> tuple[str | None, str | None, str | None]:
+    """Extract user@host, identity file, and port from SSH connect string.
+    Strips -R reverse tunnel args. Returns (user@host, identity_file, port)."""
     parts = ssh_cmd.split()
     user_host = None
     identity_file = None
+    port = None
     skip_next = False
     i = 0
     while i < len(parts):
@@ -209,7 +210,9 @@ def parse_ssh_string(ssh_cmd: str) -> tuple[str, str | None]:
             i += 1
             continue
         if p == "-p":
-            skip_next = True  # skip port (gateway port, not needed for direct sshfs)
+            if i + 1 < len(parts):
+                port = parts[i + 1]
+                skip_next = True
             i += 1
             continue
         if p == "-i":
@@ -218,16 +221,15 @@ def parse_ssh_string(ssh_cmd: str) -> tuple[str, str | None]:
                 skip_next = True
             i += 1
             continue
-        # Remaining non-flag arg is user@host
         if not p.startswith("-"):
             user_host = p
         i += 1
-    return user_host, identity_file
+    return user_host, identity_file, port
 
 
 def sshfs_mount(machine: Machine, remote_path: str) -> tuple[bool, str]:
     """Mount a remote path via SSHFS. Returns (success, message)."""
-    user_host, identity_file = parse_ssh_string(machine.ssh_cmd)
+    user_host, identity_file, port = parse_ssh_string(machine.ssh_cmd)
     if not user_host:
         return False, "Could not parse user@host from SSH string"
 
@@ -241,6 +243,8 @@ def sshfs_mount(machine: Machine, remote_path: str) -> tuple[bool, str]:
 
     # Create remote directory via SSH
     ssh_args = ["ssh"]
+    if port:
+        ssh_args.extend(["-p", port])
     if identity_file:
         ssh_args.extend(["-i", identity_file])
     ssh_args.extend(["-o", "StrictHostKeyChecking=no", user_host, f"mkdir -p {remote_path}"])
@@ -250,6 +254,8 @@ def sshfs_mount(machine: Machine, remote_path: str) -> tuple[bool, str]:
 
     # SSHFS mount
     sshfs_args = ["sshfs"]
+    if port:
+        sshfs_args.extend(["-p", port])
     if identity_file:
         sshfs_args.extend(["-o", f"IdentityFile={identity_file}"])
     sshfs_args.extend(["-o", "StrictHostKeyChecking=no", f"{user_host}:{remote_path}", local_mount])
