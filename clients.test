@@ -1,0 +1,4 @@
+TEST
+bu_test
+ssh -i /home/user/.ssh/id_root_rsa root@nas
+/home/user/restic_tui/repo

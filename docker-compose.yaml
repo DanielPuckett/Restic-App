@@ -1,0 +1,11 @@
+services:
+  restic-tui:
+    build: .
+    container_name: restic-tui
+    stdin_open: true
+    tty: true
+    volumes:
+      - /mnt/restic_tui:/mnt/restic_tui
+      - /home/user/restic_tui:/home/user/restic_tui
+    environment:
+      - TERM=xterm-256color

@@ -1,0 +1,12 @@
+# Path to the clients file (4 lines per machine: name, bu_user, ssh_cmd, repo_path)
+clients_file: /mnt/restic_tui/clients
+
+# Default restic password (can be overridden per-machine in future)
+# For production, use a stub script that sets RESTIC_PASSWORD
+restic_password: ""
+
+# Where to stage restores locally before pushing to clients
+restore_dir: /mnt/restic_tui/restores
+
+# Delete batch size
+delete_batch_size: 50
