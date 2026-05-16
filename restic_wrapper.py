@@ -120,8 +120,23 @@ def ls_snapshot(repo_path: str, password: str, snapshot_id: str) -> list[Node]:
     return nodes
 
 
+def _fix_repo_ownership(repo_path: str) -> str:
+    """Fix ownership of repo files after root operations.
+    Uses stat on the repo dir to get the correct UID/GID."""
+    try:
+        stat = os.stat(repo_path)
+        uid = stat.st_uid
+        gid = stat.st_gid
+    except OSError as e:
+        return f"WARNING: could not stat repo: {e}"
+    r = subprocess.run(["chown", "-R", f"{uid}:{gid}", repo_path], capture_output=True, text=True)
+    if r.returncode != 0:
+        return f"WARNING: chown failed: {r.stderr}"
+    return ""
+
+
 def forget_snapshots(repo_path: str, password: str, ids: list[str]) -> str:
-    """Forget (delete) snapshots by ID."""
+    """Forget (delete) snapshots by ID, then fix ownership."""
     results = []
     for sid in ids:
         r = _run(repo_path, password, ["forget", sid])
@@ -129,14 +144,20 @@ def forget_snapshots(repo_path: str, password: str, ids: list[str]) -> str:
             results.append(f"ERROR forgetting {sid}: {r.stderr}")
         else:
             results.append(f"Forgot {sid}")
+    warn = _fix_repo_ownership(repo_path)
+    if warn:
+        results.append(warn)
     return "\n".join(results)
 
 
 def prune(repo_path: str, password: str) -> str:
-    """Prune unreferenced data from the repo."""
+    """Prune unreferenced data from the repo, then fix ownership."""
     r = _run(repo_path, password, ["prune"], timeout=1800)
     if r.returncode != 0:
         return f"ERROR: {r.stderr}\n{r.stdout}"
+    warn = _fix_repo_ownership(repo_path)
+    if warn:
+        return (r.stdout or "Prune completed.") + f"\n{warn}"
     return r.stdout or "Prune completed."
 
 

@@ -454,7 +454,10 @@ class ResticApp(App):
             self._status(f"Cleaned up {len(stale)} stale mount(s).")
 
     def _status(self, msg: str) -> None:
-        self.query_one("#status-bar", Label).update(msg)
+        try:
+            self.query_one("#status-bar", Label).update(msg)
+        except Exception:
+            pass
 
     def _get_machine(self) -> restic.Machine | None:
         sel = self.query_one("#machine-select", Select).value
