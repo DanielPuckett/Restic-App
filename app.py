@@ -72,13 +72,14 @@ class OutputScreen(ModalScreen):
 class RestoreScreen(ModalScreen):
     REMOTE_PATH = "/mnt/restic.restore"
 
-    def __init__(self, repo_path: str, password: str, snapshot_id: str, item_path: str | None, machine: restic.Machine | None) -> None:
+    def __init__(self, repo_path: str, password: str, snapshot_id: str, item_path: str | None, machine: restic.Machine | None, all_machines: list[restic.Machine] | None = None) -> None:
         super().__init__()
         self.repo_path = repo_path
         self.password = password
         self.snapshot_id = snapshot_id
         self.item_path = item_path
         self.machine = machine
+        self.all_machines = all_machines or ([machine] if machine else [])
 
     def compose(self) -> ComposeResult:
         what = self.item_path or "Full snapshot"
@@ -96,6 +97,12 @@ class RestoreScreen(ModalScreen):
                 [("none", "none"), ("dry-run (preview only)", "dry-run")],
                 value="none", id="extra-opts",
             )
+            if self.machine:
+                yield Label("Push target client:")
+                yield Select(
+                    [(m.name, m.name) for m in self.all_machines],
+                    value=self.machine.name, id="target-machine",
+                )
             with Horizontal(id="re-buttons"):
                 yield Button("Local Restore", variant="warning", id="local")
                 if self.machine:
@@ -127,10 +134,13 @@ class RestoreScreen(ModalScreen):
             self.app.push_screen(OutputScreen("Restore Result", output))
 
         elif event.button.id == "push":
+            # Get the selected target machine
+            target_name = self.query_one("#target-machine", Select).value
+            target_machine = next((m for m in self.all_machines if m.name == target_name), self.machine)
             self.dismiss()
             self.app.push_screen(PushRestoreScreen(
                 self.repo_path, self.password, self.snapshot_id,
-                self.item_path, self.machine,
+                self.item_path, target_machine,
                 self.query_one("#overwrite", Select).value,
                 self.query_one("#extra-opts", Select).value,
             ))
@@ -265,12 +275,13 @@ class DetailScreen(ModalScreen):
         Binding("3", "sort_by_3", "Sort:Modified"),
     ]
 
-    def __init__(self, repo_path: str, password: str, snapshot_id: str, machine: restic.Machine | None = None) -> None:
+    def __init__(self, repo_path: str, password: str, snapshot_id: str, machine: restic.Machine | None = None, all_machines: list[restic.Machine] | None = None) -> None:
         super().__init__()
         self.repo_path = repo_path
         self.password = password
         self.snapshot_id = snapshot_id
         self.machine = machine
+        self.all_machines = all_machines or []
         self.nodes: list[restic.Node] = []
         self.sort_key = "default"
 
@@ -375,7 +386,7 @@ class DetailScreen(ModalScreen):
     def action_restore_item(self) -> None:
         path = self._get_selected_path()
         if path:
-            self.app.push_screen(RestoreScreen(self.repo_path, self.password, self.snapshot_id, path, self.machine))
+            self.app.push_screen(RestoreScreen(self.repo_path, self.password, self.snapshot_id, path, self.machine, self.all_machines))
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
@@ -395,7 +406,7 @@ class ResticApp(App):
     #confirm-buttons { height: 3; align: center middle; }
     #output-dialog { width: 80%; height: 80%; border: thick $accent; padding: 1 2; }
     #output-body { height: 1fr; }
-    #re-dialog { width: 70; height: 22; border: thick $accent; padding: 1 2; align: center middle; }
+    #re-dialog { width: 70; height: 26; border: thick $accent; padding: 1 2; align: center middle; }
     #re-buttons { height: 3; align: center middle; }
     #detail-screen { width: 100%; height: 100%; }
     #detail-tree { height: 1fr; }
@@ -659,7 +670,7 @@ class ResticApp(App):
         if not self.current_machine:
             return
         password = self.cfg.get("restic_password", "")
-        self.push_screen(DetailScreen(self.current_machine.repo_path, password, sid, self.current_machine))
+        self.push_screen(DetailScreen(self.current_machine.repo_path, password, sid, self.current_machine, self.machines))
 
 
 def main():
