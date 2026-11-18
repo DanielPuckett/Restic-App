@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 config.yaml
+.env
 last_output.log
 restores/
