@@ -105,6 +105,17 @@ ssh -R 8000:127.0.0.1:22 -i /path/to/key root@nas
 
 Fields: friendly name, backup username, SSH connect command, repo path.
 
+The repo path can be either a repo itself or a **parent folder holding several repos**. If the path contains `config` and `keys/` it is used as the repo. Otherwise each immediate subfolder with `config` and `keys/` is offered in a Repo dropdown (hidden when only one is found). Other folders are ignored. The label is the folder name with a `repo-` prefix removed (`repo-pg-app` shows as `pg-app`), and a folder named `repo` is the default.
+
+```
+WEB3
+bu_web3
+ssh -R 8000:127.0.0.1:22 -i /path/to/key root@web3
+/mnt/BACKUPS/secure/bu_web3
+```
+
+Repos are rescanned each time a machine is selected, so a new repo appears without a restart. All repos currently share the one `restic_password`.
+
 The SSH connect command is used for push-to-client restores (reverse tunnel flags are automatically stripped for SSHFS).
 
 ## Docker Mounts

@@ -433,6 +433,8 @@ class ResticApp(App):
         self.marked: set[str] = set()
         self.sort_newest_first = True
         self.current_machine: restic.Machine | None = None
+        self.current_repo_path: str = ""
+        self.current_repo_label: str = ""
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -441,6 +443,7 @@ class ResticApp(App):
                 [(m.name, m.name) for m in self.machines],
                 prompt="Machine", id="machine-select",
             )
+            yield Select([], prompt="Repo", id="repo-select")
             yield Input(placeholder="From YYYY-MM-DD", id="date-from")
             yield Input(placeholder="To YYYY-MM-DD", id="date-to")
             yield Button("Load", id="load-btn")
@@ -456,6 +459,7 @@ class ResticApp(App):
         table.add_column("Time", key="time")
         table.add_column("Hostname", key="hostname")
         table.add_column("Paths", key="paths")
+        self.query_one("#repo-select", Select).display = False
         now = datetime.now(timezone.utc)
         self.query_one("#date-from", Input).value = (now - timedelta(days=30)).strftime("%Y-%m-%d")
         self.query_one("#date-to", Input).value = now.strftime("%Y-%m-%d")
@@ -470,11 +474,33 @@ class ResticApp(App):
         except Exception:
             pass
 
+    def _repo_name(self) -> str:
+        """Display name like 'WEB3 / pg-app' for the loaded machine and repo."""
+        name = self.current_machine.name if self.current_machine else ""
+        return f"{name} / {self.current_repo_label}" if self.current_repo_label else name
+
     def _get_machine(self) -> restic.Machine | None:
         sel = self.query_one("#machine-select", Select).value
         if sel is Select.BLANK:
             return None
         return next((m for m in self.machines if m.name == sel), None)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "machine-select":
+            return
+        machine = self._get_machine()
+        repo_select = self.query_one("#repo-select", Select)
+        if not machine:
+            repo_select.display = False
+            return
+        repos = restic.discover_repos(machine.repo_path)
+        repo_select.set_options([(label, path) for label, path in repos])
+        if repos:
+            repo_select.value = repos[0][1]
+            self._status(f"{machine.name}: {len(repos)} repo(s) found.")
+        else:
+            self._status(f"No repos found under {machine.repo_path}: {restic.explain_no_repos(machine.repo_path)}")
+        repo_select.display = len(repos) > 1
 
     def action_load_snapshots(self) -> None:
         self._do_load()
@@ -499,8 +525,15 @@ class ResticApp(App):
                     self._status(f"Invalid {label} date: {val} (use YYYY-MM-DD)")
                     return
 
+        repo_path = self.query_one("#repo-select", Select).value
+        if repo_path is Select.BLANK:
+            self._status(f"No repos found under {machine.repo_path}: {restic.explain_no_repos(machine.repo_path)}")
+            return
+        label = next((l for l, p in restic.discover_repos(machine.repo_path) if p == repo_path), "")
         self.current_machine = machine
-        self._status(f"⏳ Loading snapshots for {machine.name}...")
+        self.current_repo_path = repo_path
+        self.current_repo_label = label
+        self._status(f"⏳ Loading snapshots for {self._repo_name()}...")
         self.marked.clear()
         table = self.query_one("#snapshot-table", DataTable)
         table.clear()
@@ -509,7 +542,7 @@ class ResticApp(App):
     async def _load(self, machine: restic.Machine, date_from: str, date_to: str) -> None:
         password = self.cfg.get("restic_password", "")
         try:
-            all_snaps = await asyncio.to_thread(restic.list_snapshots, machine.repo_path, password)
+            all_snaps = await asyncio.to_thread(restic.list_snapshots, self.current_repo_path, password)
         except Exception as e:
             self._status(f"Error: {e}")
             return
@@ -615,7 +648,7 @@ class ResticApp(App):
         password = self.cfg.get("restic_password", "")
         ids = list(self.marked)
         self._status(f"⏳ Forgetting {len(ids)} snapshots...")
-        output = await asyncio.to_thread(restic.forget_snapshots, self.current_machine.repo_path, password, ids)
+        output = await asyncio.to_thread(restic.forget_snapshots, self.current_repo_path, password, ids)
         self.marked.clear()
         self._status(f"Forgot {len(ids)} snapshots. Reload to refresh. Run Prune to reclaim space.")
         self.push_screen(OutputScreen("Forget Results", output))
@@ -625,7 +658,7 @@ class ResticApp(App):
             self._status("Select a machine first.")
             return
         self.push_screen(
-            ConfirmScreen(f"Prune {self.current_machine.name} repo?\n\nThis removes unreferenced data and may take a while."),
+            ConfirmScreen(f"Prune {self._repo_name()}?\n\nThis removes unreferenced data and may take a while."),
             callback=self._on_prune_confirm,
         )
 
@@ -636,8 +669,8 @@ class ResticApp(App):
 
     async def _do_prune(self) -> None:
         password = self.cfg.get("restic_password", "")
-        self._status(f"⏳ Pruning {self.current_machine.name}... this may take a while")
-        output = await asyncio.to_thread(restic.prune, self.current_machine.repo_path, password)
+        self._status(f"⏳ Pruning {self._repo_name()}... this may take a while")
+        output = await asyncio.to_thread(restic.prune, self.current_repo_path, password)
         self._status("Prune completed.")
         self.push_screen(OutputScreen("Prune Results", output))
 
@@ -649,13 +682,13 @@ class ResticApp(App):
 
     async def _do_stats(self) -> None:
         password = self.cfg.get("restic_password", "")
-        self._status(f"⏳ Getting stats for {self.current_machine.name}...")
-        st = await asyncio.to_thread(restic.stats, self.current_machine.repo_path, password)
+        self._status(f"⏳ Getting stats for {self._repo_name()}...")
+        st = await asyncio.to_thread(restic.stats, self.current_repo_path, password)
         if st:
             size = restic.format_size(st.get("total_size", 0))
             files = st.get("total_file_count", 0)
             snaps = st.get("snapshots_count", 0)
-            text = f"Repository: {self.current_machine.name}\nPath: {self.current_machine.repo_path}\n\nTotal size: {size}\nTotal files: {files}\nSnapshots: {snaps}"
+            text = f"Repository: {self._repo_name()}\nPath: {self.current_repo_path}\n\nTotal size: {size}\nTotal files: {files}\nSnapshots: {snaps}"
         else:
             text = "Failed to get stats."
         self._status("Stats loaded.")
@@ -670,7 +703,7 @@ class ResticApp(App):
         if not self.current_machine:
             return
         password = self.cfg.get("restic_password", "")
-        self.push_screen(DetailScreen(self.current_machine.repo_path, password, sid, self.current_machine, self.machines))
+        self.push_screen(DetailScreen(self.current_repo_path, password, sid, self.current_machine, self.machines))
 
 
 def main():

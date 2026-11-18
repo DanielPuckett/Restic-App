@@ -57,6 +57,68 @@ def load_machines(clients_file: str) -> list[Machine]:
     return machines
 
 
+def is_repo(path: str) -> bool:
+    """Cheap structural check for a restic repo: a 'config' file and a 'keys' dir.
+    Needs no password. restic itself will complain if it is a false positive."""
+    return os.path.isfile(os.path.join(path, "config")) and os.path.isdir(os.path.join(path, "keys"))
+
+
+def _repo_label(dirname: str) -> str:
+    """Friendly label for a repo folder: 'repo-pg-app' -> 'pg-app'."""
+    if dirname.startswith("repo-") and len(dirname) > len("repo-"):
+        return dirname[len("repo-"):]
+    return dirname
+
+
+def discover_repos(path: str) -> list[tuple[str, str]]:
+    """Resolve a clients-file path into (label, repo_path) pairs.
+
+    If the path is itself a repo, it is the only entry. Otherwise each immediate
+    subfolder that looks like a repo is listed. A folder named 'repo' sorts first
+    so it becomes the default; the rest are alphabetical.
+    """
+    if not path:
+        return []
+    if is_repo(path):
+        return [(_repo_label(os.path.basename(path.rstrip("/"))), path)]
+    try:
+        names = sorted(n for n in os.listdir(path) if not n.startswith("."))
+    except OSError:
+        return []
+    found = []
+    for n in names:
+        sub = os.path.join(path, n)
+        if os.path.isdir(sub) and is_repo(sub):
+            found.append((_repo_label(n), sub))
+    found.sort(key=lambda r: (os.path.basename(r[1]) != "repo", r[0]))
+    return found
+
+
+def explain_no_repos(path: str) -> str:
+    """Human-readable reason why discover_repos(path) came back empty."""
+    if not os.path.exists(path):
+        return "path does not exist in the container (is it mounted?)"
+    if not os.path.isdir(path):
+        return "path is not a directory"
+    try:
+        names = sorted(os.listdir(path))
+    except OSError as e:
+        return f"cannot read directory: {e}"
+    if not names:
+        return "directory is empty"
+    parts = []
+    for n in names[:8]:
+        sub = os.path.join(path, n)
+        if os.path.isdir(sub):
+            cfg = "Y" if os.path.isfile(os.path.join(sub, "config")) else "N"
+            keys = "Y" if os.path.isdir(os.path.join(sub, "keys")) else "N"
+            parts.append(f"{n}/(config={cfg} keys={keys})")
+        else:
+            parts.append(n)
+    more = f" +{len(names) - 8} more" if len(names) > 8 else ""
+    return "saw: " + ", ".join(parts) + more
+
+
 def _run(repo_path: str, password: str, args: list[str], timeout: int = 600, json_output: bool = False) -> subprocess.CompletedProcess:
     """Run a restic command against a local repo."""
     env = os.environ.copy()
