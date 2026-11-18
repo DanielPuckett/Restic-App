@@ -57,4 +57,9 @@ prune:
       path: /mnt/restic_tui/drills/db_tests.log
       truncate: true
       fail_pattern: "^RESULT FAIL"
-      expect_pattern: "^RESULT "
+      expect_pattern: "^RESULT "     # one line per drill run
+      expect_count: 4                # fewer means a run died before finishing (FAIL)
+      count_patterns:                # tallied in the report summary
+        PASS: "^RESULT PASS"
+        SKIP: "^RESULT SKIP"
+        FAIL: "^RESULT FAIL"

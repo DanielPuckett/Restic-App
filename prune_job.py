@@ -417,13 +417,32 @@ def run_include(inc: dict, now: datetime, dry_run: bool, retention_days: int) ->
 
     fail_re = re.compile(inc["fail_pattern"], re.M) if inc.get("fail_pattern") else None
     expect_re = re.compile(inc["expect_pattern"], re.M) if inc.get("expect_pattern") else None
+    expect_count = int(inc.get("expect_count") or 0)
+
+    # Tally, e.g. "summary: PASS 3 / SKIP 1 / FAIL 0 / results 4 of 4"
+    tally = [f"{label} {len(re.findall(rx, text, re.M))}" for label, rx in (inc.get("count_patterns") or {}).items()]
+    results = [x.strip() for x in text.splitlines() if expect_re and expect_re.search(x)]
+    if expect_re:
+        tally.append(f"results {len(results)}" + (f" of {expect_count}" if expect_count else ""))
+    if tally:
+        lines.append("  summary: " + " / ".join(tally))
+    for r in results:
+        lines.append(f"    {r}")
+
     if fail_re and fail_re.search(text):
         status = FAIL
         n = len(fail_re.findall(text))
         lines.append(f"  FAIL {n} line(s) match {inc['fail_pattern']!r}")
-    if expect_re and not expect_re.search(text):
-        status = _worst(status, WARN)
-        lines.append(f"  WARN no line matches {inc['expect_pattern']!r}")
+    if expect_re:
+        if expect_count and len(results) < expect_count:
+            status = FAIL
+            lines.append(f"  FAIL only {len(results)} of {expect_count} runs reported a result; "
+                         f"{expect_count - len(results)} died before finishing (SSH, tunnel, crash?)")
+        elif not results:
+            status = _worst(status, WARN)
+            lines.append(f"  WARN no line matches {inc['expect_pattern']!r}")
+        elif expect_count and len(results) > expect_count:
+            lines.append(f"  note: {len(results)} results, more than the expected {expect_count} (extra manual run?)")
     if read_from != path:
         lines.append(f"  rotated to {read_from}")
     elif inc.get("truncate"):
@@ -506,6 +525,24 @@ def send_email(subject: str, body: str, env: dict) -> str:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def attention_reasons(lines: list[str]) -> list[tuple[str, str]]:
+    """Pull FAIL/WARN/SKIPPED reasons out of a section, prefixed with the path they belong to."""
+    out, path = [], ""
+    for x in lines:
+        m = re.match(r"^  (/\S*)  \[", x)
+        if m:
+            path = m.group(1)
+            continue
+        t = x.strip()
+        if t.startswith(("FAIL", "WARN", "SKIPPED")):
+            level, _, rest = t.split("\n", 1)[0].rstrip(":").partition(" ")
+            level = level.rstrip(":")
+            level = WARN if level.startswith("WARN") else level  # 'WARNING:' from the ownership fix
+            indented = x.startswith("    ")
+            out.append((level, f"{path}: {rest}" if indented and path else rest))
+    return out
+
+
 def load_prune_config(cfg: dict) -> dict:
     merged = dict(DEFAULT_PRUNE)
     merged.update(cfg.get("prune") or {})
@@ -541,13 +578,16 @@ def main(argv: list[str] | None = None) -> int:
     counts = {FAIL: 0, WARN: 0, SKIPPED: 0, OK: 0}
     body: list[str] = []
     all_forgets: list[str] = []
+    attention: list[str] = []
+    include_summaries: list[str] = []
 
     for m in machines:
         repos = restic.discover_repos(m.repo_path)
         if not repos:
             counts[FAIL] += 1
-            body += [f"== {m.name}  ({m.repo_path})  FAIL",
-                     f"  no repos found: {restic.explain_no_repos(m.repo_path)}", ""]
+            why = f"no repos found: {restic.explain_no_repos(m.repo_path)}"
+            body += [f"== {m.name}  ({m.repo_path})  FAIL", f"  {why}", ""]
+            attention.append(f"FAIL     {m.name}: {why}")
             continue
         for label, rpath in repos:
             name = f"{m.name} / {label}"
@@ -558,6 +598,8 @@ def main(argv: list[str] | None = None) -> int:
                                lines=["  FAIL unexpected error:"] + [f"    {x}" for x in traceback.format_exc().splitlines()])
             counts[r.status] += 1
             body += [f"== {name}  ({rpath})  {r.status}"] + r.lines + [""]
+            if r.status != OK:
+                attention += [f"{lvl:<8} {name}: {why}" for lvl, why in attention_reasons(r.lines)]
             all_forgets += [f"{name}\t{sid}" for sid in r.forget_ids]
 
     for inc in pcfg.get("report_includes") or []:
@@ -567,12 +609,23 @@ def main(argv: list[str] | None = None) -> int:
             st, lines = FAIL, [f"== {inc.get('title', inc.get('path'))}", f"  FAIL could not read include: {e}"]
         counts[st] += 1
         body += lines + [""]
+        title = inc.get("title") or inc.get("path")
+        summary = next((x.strip() for x in lines if x.startswith("  summary: ")), "")
+        if summary:
+            include_summaries.append(f"{st:<8} {title}: {summary[len('summary: '):]}")
+        if st != OK:
+            attention += [f"{lvl:<8} {title}: {why}" for lvl, why in attention_reasons(lines)]
 
     flags = [x for x, on in (("dry-run", args.dry_run), ("no-cap", args.no_cap)) if on]
     header = f"[restic] FAIL {counts[FAIL]} / WARN {counts[WARN]} / SKIPPED {counts[SKIPPED]} / OK {counts[OK]}"
     if flags:
         header += f" ({', '.join(flags)})"
-    report = "\n".join([header, f"run at {now.strftime('%Y-%m-%d %H:%M:%S')} UTC", ""] + body)
+    top = ["Summary", "-------"]
+    top += ["Needs attention:"] + [f"  {x}" for x in attention] if attention else ["Everything OK."]
+    if include_summaries:
+        top += ["Report includes:"] + [f"  {x}" for x in include_summaries]
+    top += ["", "Details", "-------", ""]
+    report = "\n".join([header, f"run at {now.strftime('%Y-%m-%d %H:%M:%S')} UTC", ""] + top + body)
 
     email_err = ""
     if args.no_email:

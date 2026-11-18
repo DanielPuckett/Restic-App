@@ -247,6 +247,30 @@ open(log, "w").write("== app\nunpacking...\n")
 st, _ = pj.run_include(inc, NOW + timedelta(seconds=2), False, 30)
 check(st == pj.WARN, "include: no RESULT line -> WARN")
 
+# Counted drill results: 4 DBs, one script, one log
+inc4 = dict(inc, expect_count=4, count_patterns={"PASS": "^RESULT PASS", "SKIP": "^RESULT SKIP", "FAIL": "^RESULT FAIL"})
+drill = ("== ast on web3\nPASS rows\nRESULT PASS ast on web3\n"
+         "== app on web3\nno snapshots\nRESULT SKIP app on web3\n"
+         "== app on web4\nRESULT PASS app on web4\n"
+         "== ast on web4\nRESULT PASS ast on web4\n")
+open(log, "w").write(drill)
+st, lines = pj.run_include(inc4, NOW + timedelta(seconds=3), False, 30)
+summ = next(l for l in lines if "summary:" in l)
+check(st == pj.OK and "PASS 3 / SKIP 1 / FAIL 0 / results 4 of 4" in summ, f"drills 3 PASS + 1 SKIP -> OK ({summ.strip()})")
+check(sum("    RESULT " in l for l in lines) >= 4, "drills: each RESULT line listed under the summary")
+
+open(log, "w").write(drill.replace("== ast on web4\nRESULT PASS ast on web4\n", "== ast on web4\nssh: connect to host web4: Connection refused\n"))
+st, lines = pj.run_include(inc4, NOW + timedelta(seconds=4), False, 30)
+check(st == pj.FAIL and any("only 3 of 4" in l for l in lines), "drills: a run that died before RESULT -> FAIL (3 of 4)")
+
+open(log, "w").write(drill.replace("RESULT PASS app on web4", "RESULT FAIL app on web4"))
+st, lines = pj.run_include(inc4, NOW + timedelta(seconds=5), False, 30)
+check(st == pj.FAIL and "PASS 2 / SKIP 1 / FAIL 1" in next(l for l in lines if "summary:" in l), "drills: RESULT FAIL counted and FAIL")
+
+open(log, "w").write(drill + drill)
+st, lines = pj.run_include(inc4, NOW + timedelta(seconds=6), False, 30)
+check(st == pj.OK and any("more than the expected 4" in l for l in lines), "drills: extra manual run -> note, still OK")
+
 # ── env + email config ───────────────────────────────────────────────────────
 envf = os.path.join(tmp, ".env")
 open(envf, "w").write("# SMTP\nSMTP_HOST=smtp.example.com\nSMTP_PORT=587\nSMTP_PASS='se=cret'\n")
@@ -284,10 +308,14 @@ last = open(os.path.join(tmp, "last_prune.txt")).read()
 check(last.startswith("[restic] FAIL 2 / WARN 0 / SKIPPED 0 / OK 1 (dry-run)"), f"main dry-run header (both repos over cap): {last.splitlines()[0]}")
 check("deletion cap" in last and "email: email not configured" in last, "main: cap failure and unconfigured email reported")
 check(rc == 1, "main: exit 1 when any FAIL")
+top = last.split("Details")[0]
+check("Needs attention:" in top and "FAIL     WEB3 / repo: deletion cap" in top and "FAIL     WEB3 / pg-ast: deletion cap" in top,
+      "main: summary lists each FAIL with machine/repo and reason")
 check(os.path.exists(log), "main dry-run: include not rotated")
 rc = pj.main(["--config", cfgf, "--dry-run", "--no-cap", "--no-email"])
 last = open(os.path.join(tmp, "last_prune.txt")).read()
 check(last.startswith("[restic] FAIL 0 / WARN 0 / SKIPPED 0 / OK 3 (dry-run, no-cap)") and rc == 0, f"main no-cap: {last.splitlines()[0]}")
+check("Everything OK." in last.split("Details")[0], "main: clean run summary says Everything OK.")
 check(any(n.endswith(".forgets.txt") for n in os.listdir(os.path.join(tmp, "reports"))), "main: .forgets.txt written")
 print("\n----- sample report (truncated) -----")
 print("\n".join(last.splitlines()[:40]))

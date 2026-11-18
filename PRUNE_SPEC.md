@@ -93,7 +93,8 @@ Checked per repo before any deletion. If a guard fails, the repo is not changed.
 - Exit code: 1 if anything is FAIL or the email failed, otherwise 0.
 - Header line, which becomes the email subject:
   `[restic] FAIL 1 / WARN 0 / SKIPPED 0 / OK 11 (dry-run)`
-- For each repo and each path: the policy matched, how many snapshots were kept and deleted, the oldest and newest kept snapshot with dates, and any failed guard with the reason.
+- A **Summary** comes first, under the header: "Needs attention" lists every FAIL, WARN and SKIPPED reason as `LEVEL  MACHINE / repo: path: reason` (or "Everything OK."), followed by a one-line tally for each report include. The details follow.
+- Details, for each repo and each path: the policy matched, how many snapshots were kept and deleted, the oldest and newest kept snapshot with dates, and any failed guard with the reason.
 
 ## Report includes
 
@@ -106,16 +107,24 @@ report_includes:
     truncate: true
     fail_pattern: "^RESULT FAIL"
     expect_pattern: "^RESULT "
+    expect_count: 4
+    count_patterns:
+      PASS: "^RESULT PASS"
+      SKIP: "^RESULT SKIP"
+      FAIL: "^RESULT FAIL"
 ```
 
 - **truncate**: after the include is read, the next run starts with an empty file. This is done by renaming the file to `<name>.YYYYMMDD-HHMMSS` before reading it, not by truncating in place, so lines appended during the prune run are not lost. A new `>>` creates a fresh file. Renamed copies are deleted after 30 days.
 - **fail_pattern**: any matching line counts as FAIL in the report header.
-- **expect_pattern**: if the file has content but no line matches, it counts as WARN (for example, a drill that crashed before printing `RESULT`).
+- **expect_pattern**: marks one result line per run. The matching lines are listed under the include's summary. If the file has content but no line matches, it counts as WARN.
+- **expect_count**: the number of runs expected per report. Fewer result lines count as **FAIL**, because a run that died before finishing (SSH, tunnel or crash) prints no `RESULT` line and its DB was not verified. Counting only `RESULT FAIL` would miss that. More lines than expected (an extra manual run) is a note, not a failure.
+- **count_patterns**: label → pattern, tallied in the summary, for example `PASS 3 / SKIP 1 / FAIL 0 / results 4 of 4`.
 - A missing or empty file is reported as "nothing new", not as a failure (for example, weekly drills).
 - `--dry-run` reads includes but does not rotate them.
 - Each include is capped at about 200 KB in the report. If a file is larger, the last part is kept.
-- Writers should capture stderr as well:
-  `pg-restore.restic.sh ast >> /mnt/restic_tui/drills/db_tests.log 2>&1`
+- Writers should capture stderr as well. The weekly drill (all DBs in one script, run as the backup-server user that holds the client SSH keys):
+  `0 23 * * 0 /home/user/dbtest.sh >> /mnt/restic_tui/drills/db_tests.log 2>&1`
+- A drill cron that never runs is silent: the file is simply empty ("nothing new").
 
 **Scheduling**: `prune` takes an exclusive repo lock and the drill's `restic restore` takes a shared one. Do not schedule drills to overlap the 6 AM prune.
 
