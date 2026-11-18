@@ -20,6 +20,7 @@ scp "$NAS:$SRC/docker-compose.yaml" "$DEST/"
 scp "$NAS:$SRC/requirements.txt" "$DEST/"
 scp "$NAS:$SRC/restic_wrapper.py" "$DEST/"
 scp "$NAS:$SRC/app.py" "$DEST/"
+scp "$NAS:$SRC/prune_job.py" "$DEST/"
 
 echo "Pulling config and clients..."
 [ -f "$CONF/config.yaml" ] && echo "  config.yaml exists, skipping." || scp "$NAS:$CONF/config.yaml" "$CONF/"

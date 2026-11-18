@@ -2,11 +2,11 @@
 
 A daily cron job that applies retention policies to every discovered repo, prunes, and writes a report. It also serves as an early warning that backups are failing.
 
-Status: agreed design, not yet built.
+Status: in production. First live run on 2026-11-18 cleared the backlog on all repos.
 
 ## Vocabulary
 
-- **Group**: all snapshots in a repo with the same host + path. Every rule and check works per group.
+- **Group**: all snapshots in a repo with the same path. Every rule and check works per group. With one repo per machine, the repo already identifies the machine, so a hostname change or rebuild continues the same history (the report lists every hostname seen in the group). `group_by: host_path` splits groups by hostname too.
 - **Policy**: the retention rules for a group, chosen by matching the snapshot path against a pattern.
 - **Guard**: a precondition. If one fails, nothing is deleted in that repo and the report says FAIL.
 - **Floor**: a rule that holds no matter what. It only blocks deletion and never raises an alert.
@@ -25,7 +25,7 @@ Policies attach to snapshot paths, not repos, so they apply to every machine and
 
 DB snapshots are also tagged `pg-daily` and `pg-wal`. Policies match on path. If a snapshot's tag doesn't fit its path policy (for example, `pg-wal` on a `daily` path), the report shows a WARN.
 
-"First" means the earliest snapshot in the bucket. Restic's own `--keep-monthly` keeps the newest and has no half-year bucket, so the job computes the keep set itself and calls `restic forget <ids>`.
+"First" means the earliest snapshot in the whole calendar bucket, not just the part of the bucket inside the tier. This keeps the month that straddles a tier boundary from keeping a different snapshot each day. Restic's own `--keep-monthly` keeps the newest and has no half-year bucket, so the job computes the keep set itself and calls `restic forget <ids>`.
 
 The 2-year cap applies to DB paths only. `/home` holds code, compose files and `.env`s, with no personal data. DB files, dumps, tars and WAL under `/mnt` are excluded from `/mnt` snapshots by `_NO_BACKUP_` tag files.
 
@@ -49,7 +49,11 @@ Checked per repo before any deletion. If a guard fails, the repo is not changed.
 - **Freshness**: the newest snapshot in each group must be within:
   - 26h for `files` and `db_daily` (daily backups at 2 AM)
   - 2h for `db_wal`
-- Every path the repo has ever had is checked, so a path that silently stops being backed up goes stale and fails. Paths retired on purpose go in `retired_paths` and are skipped.
+- Every path the repo has ever had is checked, so a path that silently stops being backed up goes stale and fails.
+- **Retirement** skips the freshness check, but retention, the floor and the deletion cap still apply. A retired machine ages down to one snapshot per half-year plus the newest 3.
+  - `retired_machines: [WEB, WEB2]`: whole machines, by clients-file name, case-insensitive.
+  - `retired_paths: [WEB3:/root]`: one path on one machine. A bare `/root` retires that path on **all** machines.
+  - A retired group with a snapshot newer than its freshness limit is WARN, because it is probably still being backed up.
 - **Deletion cap**: a run may delete at most 20% of a repo's snapshots. `--no-cap` turns this off (for the initial cleanup run).
 - **Repo state**: if the repo is locked, the repo is **SKIPPED**, not FAIL (most likely a backup is running). If `restic check` (without `--read-data`) fails, the repo is **FAIL**.
 
@@ -63,13 +67,17 @@ Checked per repo before any deletion. If a guard fails, the repo is not changed.
 ## Running
 
 - Script: `prune_job.py`, reusing `restic_wrapper` (repo discovery, forget by ID, prune, ownership fix).
-- Cron (6 AM daily):
-  `0 6 * * * cd ~/restic-tui && docker compose run --rm --entrypoint python restic-tui /app/prune_job.py`
+- Cron (6 AM daily), on the backup server. `-T` is required because the compose file sets `tty: true` and cron has no terminal. Cron's PATH is minimal, so use full paths:
+  `0 6 * * * cd /home/user/restic-tui && /usr/bin/docker compose run --rm -T --entrypoint python restic-tui /app/prune_job.py >> /mnt/restic_tui/prune_cron.log 2>&1`
+  `prune_cron.log` catches failures that happen before a report can be written (for example Docker not starting).
 - Flags:
   - `--dry-run`: report what would be deleted and change nothing.
   - `--no-cap`: turn off the deletion cap (one-time initial run).
   - `--machine NAME`: limit the run to one machine (debugging).
-- Per-repo order: discover groups → check guards → compute keep set → forget by ID → prune → fix ownership.
+- Per-repo order: lock check → list snapshots → compute keep set → guards → `restic check` → forget by ID (batched, `delete_batch_size`) → fix ownership → prune.
+- `prune` runs only when something was forgotten. Space left behind by manual TUI forgets is reclaimed the next time the job forgets something, or by pruning from the TUI.
+- A path that matches no policy keeps everything and reports WARN, so new paths are noticed.
+- `--no-email`: write the report but don't send it.
 
 ### Rollout
 
@@ -79,8 +87,10 @@ Checked per repo before any deletion. If a guard fails, the repo is not changed.
 
 ## Report
 
-- Written to `/mnt/restic_tui/prune_reports/YYYY-MM-DD.txt` and `/mnt/restic_tui/last_prune.txt`.
-- Email comes later, with SMTP settings in a `.env`. The report file is the email body.
+- Written to `/mnt/restic_tui/prune_reports/YYYY-MM-DD_HHMMSS[-dry-run].txt` and `/mnt/restic_tui/last_prune.txt`. The timestamp keeps a dry run and a real run on the same day from overwriting each other.
+- The full list of forgotten IDs goes to `<same name>.forgets.txt`. The report lists at most 20 per path.
+- Email: the report is the body and the header line is the subject. SMTP settings come from `/mnt/restic_tui/.env` (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_TO`, comma-separated for several recipients). Port 465 uses implicit TLS; any other port uses STARTTLS. If email isn't configured, the report says so and the run doesn't fail. If sending fails, the job exits 1.
+- Exit code: 1 if anything is FAIL or the email failed, otherwise 0.
 - Header line, which becomes the email subject:
   `[restic] FAIL 1 / WARN 0 / SKIPPED 0 / OK 11 (dry-run)`
 - For each repo and each path: the policy matched, how many snapshots were kept and deleted, the oldest and newest kept snapshot with dates, and any failed guard with the reason.
@@ -98,7 +108,7 @@ report_includes:
     expect_pattern: "^RESULT "
 ```
 
-- **truncate**: after the include is read, the next run starts with an empty file. This is done by renaming the file to `<name>.YYYY-MM-DD` before reading it, not by truncating in place, so lines appended during the prune run are not lost. A new `>>` creates a fresh file. Renamed copies are deleted after 30 days.
+- **truncate**: after the include is read, the next run starts with an empty file. This is done by renaming the file to `<name>.YYYYMMDD-HHMMSS` before reading it, not by truncating in place, so lines appended during the prune run are not lost. A new `>>` creates a fresh file. Renamed copies are deleted after 30 days.
 - **fail_pattern**: any matching line counts as FAIL in the report header.
 - **expect_pattern**: if the file has content but no line matches, it counts as WARN (for example, a drill that crashed before printing `RESULT`).
 - A missing or empty file is reported as "nothing new", not as a failure (for example, weekly drills).
@@ -113,4 +123,4 @@ report_includes:
 
 - Add `prune_job.py` to the `COPY` line in `Dockerfile`.
 - Add `prune_job.py` to the scp list in `deploy_from_nas.sh`.
-- Copy changed files to `daniel@nas:/home/daniel/restic-tui/`, then run the deploy on the backup server.
+- Copy changed files to `user@nas:/home/user/restic-tui/`, then run the deploy on the backup server.

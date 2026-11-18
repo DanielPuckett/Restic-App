@@ -2,7 +2,7 @@
 import json
 import os
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 
@@ -22,6 +22,7 @@ class Snapshot:
     paths: list[str]
     hostname: str
     username: str
+    tags: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -131,14 +132,12 @@ def _run(repo_path: str, password: str, args: list[str], timeout: int = 600, jso
 
 
 def list_snapshots(repo_path: str, password: str) -> list[Snapshot]:
-    """List all snapshots in a repo."""
-    result = _run(repo_path, password, ["snapshots"], json_output=True)
-    if result.returncode != 0:
-        return []
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return []
+    """List all snapshots in a repo. Returns [] on any error."""
+    snaps, _ = list_snapshots_checked(repo_path, password)
+    return snaps or []
+
+
+def _parse_snapshots(data: list) -> list[Snapshot]:
     snapshots = []
     for s in data:
         try:
@@ -152,8 +151,51 @@ def list_snapshots(repo_path: str, password: str) -> list[Snapshot]:
             paths=s.get("paths", []),
             hostname=s.get("hostname", ""),
             username=s.get("username", ""),
+            tags=s.get("tags") or [],
         ))
     return snapshots
+
+
+def list_snapshots_checked(repo_path: str, password: str) -> tuple[list[Snapshot] | None, str]:
+    """List snapshots, returning (None, error) on failure so callers can tell
+    'no snapshots' from 'could not read the repo'."""
+    result = _run(repo_path, password, ["snapshots"], json_output=True)
+    if result.returncode != 0:
+        return None, (result.stderr or result.stdout).strip()
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as e:
+        return None, f"bad JSON from restic snapshots: {e}"
+    return _parse_snapshots(data or []), ""
+
+
+def list_locks(repo_path: str, password: str) -> tuple[list[str] | None, str]:
+    """Return lock IDs in the repo, or (None, error)."""
+    r = _run(repo_path, password, ["list", "locks", "--no-lock"])
+    if r.returncode != 0:
+        return None, (r.stderr or r.stdout).strip()
+    return [l for l in r.stdout.split() if l], ""
+
+
+def check(repo_path: str, password: str) -> tuple[bool, str]:
+    """Run 'restic check' (structure only, no --read-data)."""
+    r = _run(repo_path, password, ["check"], timeout=3600)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def forget_batch(repo_path: str, password: str, ids: list[str], batch_size: int = 50) -> tuple[bool, str]:
+    """Forget snapshots by ID, several per restic call. Does not prune or chown."""
+    out = []
+    ok = True
+    for i in range(0, len(ids), max(1, batch_size)):
+        chunk = ids[i:i + batch_size]
+        r = _run(repo_path, password, ["forget", *chunk])
+        if r.returncode != 0:
+            ok = False
+            out.append(f"ERROR forgetting {' '.join(chunk)}: {r.stderr.strip()}")
+        else:
+            out.append(f"Forgot {len(chunk)} snapshot(s)")
+    return ok, "\n".join(out)
 
 
 def ls_snapshot(repo_path: str, password: str, snapshot_id: str) -> list[Node]:

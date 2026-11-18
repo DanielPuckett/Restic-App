@@ -8,6 +8,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY restic_wrapper.py app.py ./
+COPY restic_wrapper.py app.py prune_job.py ./
 
 ENTRYPOINT ["python", "/app/app.py"]

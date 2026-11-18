@@ -174,6 +174,25 @@ Container runs as root (required for accessing repos owned by different `bu_*` u
 
 Stale SSHFS mounts from previous runs are automatically cleaned up on app startup.
 
+## Scheduled Prune
+
+`prune_job.py` runs daily from cron. It applies retention policies to every discovered repo, checks that backups are fresh, prunes, and emails a report. It doubles as an early warning when a machine stops backing up. Full design: [PRUNE_SPEC.md](PRUNE_SPEC.md). Config: the `prune:` section of `config.yaml` (see `config.sample.yaml`). SMTP settings: `/mnt/restic_tui/.env`.
+
+```bash
+# Preview, change nothing
+docker compose run --rm --entrypoint python restic-tui /app/prune_job.py --dry-run
+# One machine; lift the deletion cap for a one-time backlog cleanup
+docker compose run --rm --entrypoint python restic-tui /app/prune_job.py --no-cap --machine WEB2
+```
+
+Cron on the backup server (`-T` because cron has no terminal):
+
+```
+0 6 * * * cd /home/user/restic-tui && /usr/bin/docker compose run --rm -T --entrypoint python restic-tui /app/prune_job.py >> /mnt/restic_tui/prune_cron.log 2>&1
+```
+
+Reports go to `/mnt/restic_tui/prune_reports/`. Tests (no restic needed): `python3 tests/test_prune_plan.py`.
+
 ## Disaster Recovery Workflow
 
 1. Fresh Linux install on replacement machine

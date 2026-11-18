@@ -10,3 +10,51 @@ restore_dir: /mnt/restic_tui/restores
 
 # Delete batch size
 delete_batch_size: 50
+
+# ── Scheduled prune (prune_job.py) ── see PRUNE_SPEC.md
+prune:
+  report_dir: /mnt/restic_tui/prune_reports
+  last_report: /mnt/restic_tui/last_prune.txt
+  env_file: /mnt/restic_tui/.env          # SMTP_* settings for the report email
+
+  keep_last: 3                 # floor: newest N per path are never forgotten
+  max_forget_percent: 20       # guard: abort a repo if a run would forget more (override with --no-cap)
+  default_fresh_within: 26h    # freshness limit for paths that match no policy
+  group_by: path               # 'path': hostname changes continue one history; 'host_path': split by hostname
+  retired_machines: []         # machines (clients-file names) no longer backed up: no freshness check
+  retired_paths: []            # 'MACHINE:/path' for one machine, bare '/path' for ALL machines
+  include_retention_days: 30   # how long rotated include files are kept
+
+  # Durations: h, d, w, M (months), y. Paths match with shell-style * wildcards.
+  # The first policy that matches a snapshot path wins.
+  policies:
+    - name: files
+      match: [/mnt, /home, /root]
+      keep_all_within: 6M
+      tiers:
+        - {older_than: 6M, keep: monthly}      # first snapshot of each month
+        - {older_than: 2y, keep: halfyearly}   # first of Jan-Jun / Jul-Dec
+      fresh_within: 26h
+
+    - name: db_daily
+      match: ["*/db-backup/daily"]
+      keep_all_within: 6M
+      tiers:
+        - {older_than: 6M, keep: monthly}
+      max_age: 2y                  # privacy cap: nothing older is kept
+      fresh_within: 26h
+      expect_tag: pg-daily
+
+    - name: db_wal
+      match: ["*/db-backup/wal"]
+      wal_for: daily               # sibling folder holding the matching dailies
+      roll_forward: 7d             # keep WAL from the newest daily at or before now-7d
+      fresh_within: 2h
+      expect_tag: pg-wal
+
+  report_includes:
+    - title: DB restore drills
+      path: /mnt/restic_tui/drills/db_tests.log
+      truncate: true
+      fail_pattern: "^RESULT FAIL"
+      expect_pattern: "^RESULT "
