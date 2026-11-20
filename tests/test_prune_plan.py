@@ -380,7 +380,7 @@ cases = [
     ((pj.FAIL, "WEB3 / pg-ast", "/mnt/appdb/db-backup/wal", "stale: newest snapshot e6d064e1 is 3.5h ago (limit 2h)"), "FAIL WEB3/pg-ast/wal: stale 3.5h"),
     ((pj.FAIL, "WEB3 / pg-app", "", "repo has no snapshots"), "FAIL WEB3/pg-app: no snapshots"),
     ((pj.SKIPPED, "NAS / repo", "", "repo is locked (1 lock(s): abcdef12); a backup may be running"), "SKIPPED NAS: repo locked"),
-    ((pj.WARN, "DVR / repo", "/home", "canary host 'DVR' differs from snapshot host 'raspberrypiDVR'"), "WARN DVR/home: canary host mismatch"),
+    ((pj.WARN, "DVR / repo", "/home", "canary host 'newhostname' differs from snapshot host 'oldhostname'"), "WARN DVR/home: canary host mismatch"),
     ((pj.FAIL, "WEB / repo", "", "deletion cap: would forget 141 of 159 (89% > 20%); rerun with --no-cap if expected"), "FAIL WEB: deletion cap 89%"),
 ]
 for (lvl, name, path, why), want in cases:
