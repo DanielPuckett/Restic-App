@@ -40,6 +40,7 @@ DEFAULT_PRUNE = {
                 {"older_than": "2y", "keep": "halfyearly"},
             ],
             "fresh_within": "26h",
+            "canary": {"file": ".backup_canary", "max_lag": "15m"},
         },
         {
             "name": "db_daily",
@@ -205,6 +206,63 @@ def is_retired(machine: str, path: str, cfg: dict) -> str:
     return ""
 
 
+def parse_lag(spec: str) -> timedelta:
+    """'15m', '2h', '90s' -> timedelta."""
+    m = re.fullmatch(r"\s*(\d+)\s*([smh])\s*", str(spec))
+    if not m:
+        raise ValueError(f"bad canary max_lag {spec!r} (use e.g. 90s, 15m, 1h)")
+    n, unit = int(m.group(1)), m.group(2)
+    return timedelta(seconds=n * {"s": 1, "m": 60, "h": 3600}[unit])
+
+
+def evaluate_canary(text: str, snap, path: str, max_lag: timedelta) -> tuple[list[str], list[str], str]:
+    """Check canary contents 'host|path|ISO-time' against the snapshot. Returns (fails, warns, note)."""
+    line = text.strip().splitlines()[0] if text.strip() else ""
+    parts = line.split("|")
+    if len(parts) != 3:
+        return [f"canary unreadable: {line[:80]!r} (expected host|path|time)"], [], ""
+    host, cpath, stamp = (x.strip() for x in parts)
+    try:
+        written = datetime.fromisoformat(stamp)
+        if written.tzinfo is None:
+            raise ValueError("no UTC offset")
+    except ValueError as e:
+        return [f"canary time unreadable: {stamp!r} ({e})"], [], ""
+    fails, warns = [], []
+    if cpath.rstrip("/") != path.rstrip("/"):
+        fails.append(f"canary is for {cpath!r}, not {path!r}")
+    lag = snap.time - written
+    if lag < -timedelta(seconds=60):
+        fails.append(f"canary written {-lag.total_seconds() / 60:.1f} min AFTER the snapshot started (clock jump?)")
+    elif lag > max_lag:
+        fails.append(f"canary is stale: written {lag.total_seconds() / 3600:.1f}h before the snapshot "
+                     f"(limit {int(max_lag.total_seconds() // 60)} min); this backup did not capture fresh files")
+    snap_host = (snap.hostname or "").split(".")[0].lower()
+    if host.split(".")[0].lower() != snap_host:
+        warns.append(f"canary host {host!r} differs from snapshot host {snap.hostname!r}")
+    note = f"canary ok: written {max(lag.total_seconds(), 0) / 60:.1f} min before snapshot {snap.short_id}" if not fails else ""
+    return fails, warns, note
+
+
+def check_canary(gp, cfg: dict, machine: str, repo_path: str, password: str) -> None:
+    """Read the canary from the newest snapshot of a group whose policy asks for one."""
+    pol = match_policy(gp.path, cfg["policies"])
+    can = (pol or {}).get("canary")
+    if not can or not gp.snaps or is_retired(machine, gp.path, cfg):
+        return
+    newest = gp.snaps[-1]
+    fpath = gp.path.rstrip("/") + "/" + can.get("file", ".backup_canary")
+    ok, out = restic.dump_file(repo_path, password, newest.id, fpath)
+    if not ok:
+        gp.fails.append(f"canary {fpath} missing from newest snapshot {newest.short_id}: {out.splitlines()[-1] if out else 'not found'}")
+        return
+    fails, warns, note = evaluate_canary(out, newest, gp.path, parse_lag(can.get("max_lag", "15m")))
+    gp.fails += fails
+    gp.warns += warns
+    if note:
+        gp.notes.append(note)
+
+
 def plan_repo(snaps: list, cfg: dict, now: datetime, machine: str = "") -> list[GroupPlan]:
     policies = cfg["policies"]
     keep_last = int(cfg.get("keep_last", 3))
@@ -319,6 +377,8 @@ def run_repo(name: str, repo_path: str, password: str, cfg: dict, now: datetime,
         return res
 
     plans = plan_repo(snaps, cfg, now, machine)
+    for gp in plans:
+        check_canary(gp, cfg, machine, repo_path, password)
     total = len(snaps)
     forget = [s for gp in plans for s in gp.forget]
     res.forget_ids = [s.id for s in forget]
@@ -525,8 +585,8 @@ def send_email(subject: str, body: str, env: dict) -> str:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def attention_reasons(lines: list[str]) -> list[tuple[str, str]]:
-    """Pull FAIL/WARN/SKIPPED reasons out of a section, prefixed with the path they belong to."""
+def attention_reasons(lines: list[str]) -> list[tuple[str, str, str]]:
+    """Pull FAIL/WARN/SKIPPED reasons out of a section as (level, path or '', full reason)."""
     out, path = [], ""
     for x in lines:
         m = re.match(r"^  (/\S*)  \[", x)
@@ -538,9 +598,68 @@ def attention_reasons(lines: list[str]) -> list[tuple[str, str]]:
             level, _, rest = t.split("\n", 1)[0].rstrip(":").partition(" ")
             level = level.rstrip(":")
             level = WARN if level.startswith("WARN") else level  # 'WARNING:' from the ownership fix
-            indented = x.startswith("    ")
-            out.append((level, f"{path}: {rest}" if indented and path else rest))
+            out.append((level, path if x.startswith("    ") else "", rest))
     return out
+
+
+# Short labels for the summary (phone-sized); the full reason stays in Details.
+_SHORT = [
+    (r"^canary .* missing", "missing canary"),
+    (r"^canary is stale", "stale canary"),
+    (r"^canary is for", "canary wrong path"),
+    (r"^canary written .*AFTER", "canary after snapshot"),
+    (r"^canary host", "canary host mismatch"),
+    (r"^canary (time )?unreadable", "canary unreadable"),
+    (r"^stale: newest snapshot \S+ is (\S+) ago", r"stale \1"),
+    (r"^deletion cap: would forget \d+ of \d+ \((\d+)%", r"deletion cap \1%"),
+    (r"^restic check", "restic check failed"),
+    (r"^repo has no snapshots", "no snapshots"),
+    (r"^cannot (read repo|list snapshots)", "repo unreadable"),
+    (r"^repo is locked", "repo locked"),
+    (r"^marked retired but", "retired but still backing up"),
+    (r"missing tag", "tag mismatch"),
+    (r"^no policy matches", "no policy"),
+    (r"^no matching daily", "WAL without daily"),
+    (r"^forget", "forget failed"),
+    (r"^prune", "prune failed"),
+    (r"chown|could not stat", "ownership fix failed"),
+    (r"^only (\d+) of (\d+) runs", r"\1 of \2 runs finished"),
+    (r"^(\d+) line\(s\) match", r"\1 failed"),
+    (r"^no line matches", "no result lines"),
+    (r"^no repos found", "no repos found"),
+    (r"^unexpected error", "crashed (see details)"),
+    (r"^could not read include", "include unreadable"),
+]
+
+
+def short_reason(reason: str) -> str:
+    for pat, label in _SHORT:
+        m = re.search(pat, reason)
+        if m:
+            return m.expand(label)
+    return reason if len(reason) <= 40 else reason[:39] + "…"
+
+
+def short_name(name: str, path: str = "") -> str:
+    """'POOL / repo' + '/home' -> 'POOL/home'; 'WEB3 / pg-ast' + '.../db-backup/wal' -> 'WEB3/pg-ast/wal'."""
+    machine, _, label = name.partition(" / ")
+    out = machine if label in ("", "repo") else f"{machine}/{label}"
+    if path:
+        out += "/" + (os.path.basename(path.rstrip("/")) or path)
+    return out
+
+
+def summary_line(level: str, name: str, path: str, reason: str) -> str:
+    return f"{level} {short_name(name, path)}: {short_reason(reason)}"
+
+
+def short_tally(summary: str) -> str:
+    """'PASS 3 / SKIP 1 / FAIL 0 / results 4 of 4' -> 'PASS 3, SKIP 1, FAIL 0, 4/4'."""
+    parts = []
+    for p in summary.split(" / "):
+        m = re.fullmatch(r"results (\d+)(?: of (\d+))?", p.strip())
+        parts.append((f"{m[1]}/{m[2]}" if m[2] else f"{m[1]} results") if m else p.strip())
+    return ", ".join(parts)
 
 
 def load_prune_config(cfg: dict) -> dict:
@@ -587,7 +706,7 @@ def main(argv: list[str] | None = None) -> int:
             counts[FAIL] += 1
             why = f"no repos found: {restic.explain_no_repos(m.repo_path)}"
             body += [f"== {m.name}  ({m.repo_path})  FAIL", f"  {why}", ""]
-            attention.append(f"FAIL     {m.name}: {why}")
+            attention.append(summary_line(FAIL, m.name, "", why))
             continue
         for label, rpath in repos:
             name = f"{m.name} / {label}"
@@ -599,7 +718,7 @@ def main(argv: list[str] | None = None) -> int:
             counts[r.status] += 1
             body += [f"== {name}  ({rpath})  {r.status}"] + r.lines + [""]
             if r.status != OK:
-                attention += [f"{lvl:<8} {name}: {why}" for lvl, why in attention_reasons(r.lines)]
+                attention += [summary_line(lvl, name, path, why) for lvl, path, why in attention_reasons(r.lines)]
             all_forgets += [f"{name}\t{sid}" for sid in r.forget_ids]
 
     for inc in pcfg.get("report_includes") or []:
@@ -612,9 +731,9 @@ def main(argv: list[str] | None = None) -> int:
         title = inc.get("title") or inc.get("path")
         summary = next((x.strip() for x in lines if x.startswith("  summary: ")), "")
         if summary:
-            include_summaries.append(f"{st:<8} {title}: {summary[len('summary: '):]}")
+            include_summaries.append(f"{st} {title}: {short_tally(summary[len('summary: '):])}")
         if st != OK:
-            attention += [f"{lvl:<8} {title}: {why}" for lvl, why in attention_reasons(lines)]
+            attention += [f"{lvl} {title}: {short_reason(why)}" for lvl, _, why in attention_reasons(lines)]
 
     flags = [x for x, on in (("dry-run", args.dry_run), ("no-cap", args.no_cap)) if on]
     header = f"[restic] FAIL {counts[FAIL]} / WARN {counts[WARN]} / SKIPPED {counts[SKIPPED]} / OK {counts[OK]}"

@@ -183,6 +183,14 @@ def check(repo_path: str, password: str) -> tuple[bool, str]:
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
+def dump_file(repo_path: str, password: str, snapshot_id: str, path: str) -> tuple[bool, str]:
+    """Read one file from a snapshot to memory ('restic dump'). Returns (ok, contents or error)."""
+    r = _run(repo_path, password, ["dump", snapshot_id, path], timeout=120)
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout).strip()
+    return True, r.stdout
+
+
 def forget_batch(repo_path: str, password: str, ids: list[str], batch_size: int = 50) -> tuple[bool, str]:
     """Forget snapshots by ID, several per restic call. Does not prune or chown."""
     out = []

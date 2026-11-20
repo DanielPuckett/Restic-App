@@ -35,6 +35,9 @@ prune:
         - {older_than: 6M, keep: monthly}      # first snapshot of each month
         - {older_than: 2y, keep: halfyearly}   # first of Jan-Jun / Jul-Dec
       fresh_within: 26h
+      canary:                      # the backup script writes <path>/.backup_canary just before each snapshot
+        file: .backup_canary       # contents: host|path|ISO-8601 time with offset
+        max_lag: 15m               # canary must be at most this much older than the snapshot
 
     - name: db_daily
       match: ["*/db-backup/daily"]

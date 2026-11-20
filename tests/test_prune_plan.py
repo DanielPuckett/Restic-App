@@ -184,12 +184,39 @@ gsplit = pj.plan_repo(dvr, dict(CFG, group_by="host_path"), NOW)
 check(len(gsplit) == 2 and any(p.fails for p in gsplit), "group_by host_path: split by host, abandoned host goes stale")
 
 # ── run_repo guards with a fake restic ───────────────────────────────────────
+def canary_text(s, mode="ok"):
+    """What the backup script would have written just before snapshot s."""
+    path = s.paths[0]
+    written = s.time - timedelta(minutes=1)
+    if mode == "stale":
+        written = s.time - timedelta(days=1)
+    if mode == "wrongpath":
+        path = "/elsewhere"
+    host = "otherhost" if mode == "wronghost" else s.hostname
+    return f"{host}|{path}|{written.isoformat(timespec='seconds')}\n"
+
+
+def install_dump(snaps, mode="ok"):
+    by_id = {s.id: s for s in snaps}
+    dumped = []
+
+    def dump_file(r, p, sid, path):
+        dumped.append(path)
+        if mode == "missing":
+            return False, f"Fatal: cannot dump file: path {path} not found in snapshot"
+        return True, canary_text(by_id[sid], mode)
+    pj.restic.dump_file = dump_file
+    return dumped
+
+
 class Fake:
-    def __init__(self, snaps, locks=(), check_ok=True):
+    def __init__(self, snaps, locks=(), check_ok=True, canary="ok"):
         self.snaps, self.locks, self.check_ok = snaps, list(locks), check_ok
         self.forgot, self.pruned = [], False
+        self.canary = canary
 
     def install(self):
+        self.dumped = install_dump(self.snaps, self.canary)
         pj.restic.list_locks = lambda r, p: (self.locks, "")
         pj.restic.list_snapshots_checked = lambda r, p: (self.snaps, "")
         pj.restic.check = lambda r, p: (self.check_ok, "" if self.check_ok else "error: pack missing")
@@ -225,6 +252,33 @@ check(r.status == pj.FAIL and not f.forgot, "stale group blocks deletion for the
 f = Fake(stale).install()
 r = pj.run_repo("WEB / repo", "/x", "", cfg_m, NOW, dry_run=True, no_cap=True, batch_size=50, machine="WEB")
 check(r.status == pj.OK, f"run_repo on retired machine with --no-cap: OK ({r.status})")
+
+# ── canary ───────────────────────────────────────────────────────────────────
+f = Fake(home).install()
+r = pj.run_repo("WEB3 / repo", "/x", "", CFG, NOW, dry_run=True, no_cap=True, batch_size=50)
+check(r.status == pj.OK and f.dumped == ["/home/.backup_canary"] and any("canary ok: written 1.0 min" in l for l in r.lines),
+      f"canary: read from newest /home snapshot, 1 min before -> OK ({f.dumped})")
+for mode, want, text in [("missing", pj.FAIL, "missing from newest snapshot"), ("stale", pj.FAIL, "canary is stale"),
+                         ("wrongpath", pj.FAIL, "not '/home'"), ("wronghost", pj.WARN, "differs from snapshot host")]:
+    f = Fake(home, canary=mode).install()
+    r = pj.run_repo("WEB3 / repo", "/x", "", CFG, NOW, dry_run=False, no_cap=True, batch_size=50)
+    check(r.status == want and any(text in l for l in r.lines) and (want != pj.FAIL or not f.forgot),
+          f"canary {mode}: {want}{' and nothing forgotten' if want == pj.FAIL else ''}")
+f = Fake(recent_daily + wal, canary="missing").install()
+r = pj.run_repo("WEB3 / pg-ast", "/x", "", CFG, NOW, dry_run=True, no_cap=True, batch_size=50)
+check(not f.dumped and r.status == pj.OK, "canary: DB paths not checked")
+f = Fake(stale, canary="missing").install()
+r = pj.run_repo("WEB / repo", "/x", "", cfg_m, NOW, dry_run=True, no_cap=True, batch_size=50, machine="WEB")
+check(not f.dumped and r.status == pj.OK, "canary: retired machines not checked")
+s0 = home[-1]
+fails, warns, note = pj.evaluate_canary(f"web3|/home|{(s0.time + timedelta(minutes=5)).isoformat()}", s0, "/home", timedelta(minutes=15))
+check(fails and "AFTER" in fails[0], "canary written after the snapshot -> FAIL")
+fails, warns, note = pj.evaluate_canary("web3|/home|2026-11-18 02:00", s0, "/home", timedelta(minutes=15))
+check(fails and "unreadable" in fails[0], "canary time without offset -> FAIL")
+fails, warns, note = pj.evaluate_canary("garbage", s0, "/home", timedelta(minutes=15))
+check(fails and "expected host|path|time" in fails[0], "canary in wrong format -> FAIL")
+fails, warns, note = pj.evaluate_canary(f"WEB3.local|/home/|{(s0.time - timedelta(minutes=14)).isoformat()}", s0, "/home", timedelta(minutes=15))
+check(not fails and not warns, "canary: host case/domain and trailing slash ignored; 14 min is inside 15")
 
 # ── includes ─────────────────────────────────────────────────────────────────
 import tempfile  # noqa: E402
@@ -293,6 +347,7 @@ by_repo = {os.path.join(mroot, "repo"): home, os.path.join(mroot, "repo-pg-ast")
 pj.restic.list_locks = lambda r, p: ([], "")
 pj.restic.list_snapshots_checked = lambda r, p: (by_repo[r], "")
 pj.restic.check = lambda r, p: (True, "")
+install_dump(home + recent_daily + wal)
 fake_yaml = types.ModuleType("yaml")
 fake_yaml.safe_load = lambda f: {
     "clients_file": clients, "restic_password": "x",
@@ -309,7 +364,7 @@ check(last.startswith("[restic] FAIL 2 / WARN 0 / SKIPPED 0 / OK 1 (dry-run)"), 
 check("deletion cap" in last and "email: email not configured" in last, "main: cap failure and unconfigured email reported")
 check(rc == 1, "main: exit 1 when any FAIL")
 top = last.split("Details")[0]
-check("Needs attention:" in top and "FAIL     WEB3 / repo: deletion cap" in top and "FAIL     WEB3 / pg-ast: deletion cap" in top,
+check("Needs attention:" in top and "FAIL WEB3: deletion cap 82%" in top and "FAIL WEB3/pg-ast: deletion cap 62%" in top,
       "main: summary lists each FAIL with machine/repo and reason")
 check(os.path.exists(log), "main dry-run: include not rotated")
 rc = pj.main(["--config", cfgf, "--dry-run", "--no-cap", "--no-email"])
@@ -317,6 +372,25 @@ last = open(os.path.join(tmp, "last_prune.txt")).read()
 check(last.startswith("[restic] FAIL 0 / WARN 0 / SKIPPED 0 / OK 3 (dry-run, no-cap)") and rc == 0, f"main no-cap: {last.splitlines()[0]}")
 check("Everything OK." in last.split("Details")[0], "main: clean run summary says Everything OK.")
 check(any(n.endswith(".forgets.txt") for n in os.listdir(os.path.join(tmp, "reports"))), "main: .forgets.txt written")
+# Short summary lines (phone-sized)
+cases = [
+    ((pj.FAIL, "POOL / repo", "/home", 'canary /home/.backup_canary missing from newest snapshot 856f7bc6: Fatal: cannot dump file: path "/home/.backup_canary" not found in snapshot'),
+     "FAIL POOL/home: missing canary"),
+    ((pj.FAIL, "POOL / repo", "/root", "stale: newest snapshot b61467d5 is 13d ago (limit 26h)"), "FAIL POOL/root: stale 13d"),
+    ((pj.FAIL, "WEB3 / pg-ast", "/mnt/appdb/db-backup/wal", "stale: newest snapshot e6d064e1 is 3.5h ago (limit 2h)"), "FAIL WEB3/pg-ast/wal: stale 3.5h"),
+    ((pj.FAIL, "WEB3 / pg-app", "", "repo has no snapshots"), "FAIL WEB3/pg-app: no snapshots"),
+    ((pj.SKIPPED, "NAS / repo", "", "repo is locked (1 lock(s): abcdef12); a backup may be running"), "SKIPPED NAS: repo locked"),
+    ((pj.WARN, "DVR / repo", "/home", "canary host 'DVR' differs from snapshot host 'raspberrypiDVR'"), "WARN DVR/home: canary host mismatch"),
+    ((pj.FAIL, "WEB / repo", "", "deletion cap: would forget 141 of 159 (89% > 20%); rerun with --no-cap if expected"), "FAIL WEB: deletion cap 89%"),
+]
+for (lvl, name, path, why), want in cases:
+    got = pj.summary_line(lvl, name, path, why)
+    check(got == want and len(got) <= 45, f"summary: {got!r}")
+check(pj.short_tally("PASS 3 / SKIP 1 / FAIL 0 / results 4 of 4") == "PASS 3, SKIP 1, FAIL 0, 4/4", "summary: drill tally compacted")
+check(pj.short_reason("only 2 of 4 runs reported a result; 2 died before finishing (SSH, tunnel, crash?)") == "2 of 4 runs finished",
+      "summary: drill shortfall shortened")
+check(len(pj.short_reason("some brand new message nobody planned for at all, quite long")) == 40, "summary: unknown reasons truncated to 40")
+
 print("\n----- sample report (truncated) -----")
 print("\n".join(last.splitlines()[:40]))
 

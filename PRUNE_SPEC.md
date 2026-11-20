@@ -54,6 +54,12 @@ Checked per repo before any deletion. If a guard fails, the repo is not changed.
   - `retired_machines: [WEB, WEB2]`: whole machines, by clients-file name, case-insensitive.
   - `retired_paths: [WEB3:/root]`: one path on one machine. A bare `/root` retires that path on **all** machines.
   - A retired group with a snapshot newer than its freshness limit is WARN, because it is probably still being backed up.
+- **Canary** (`files` policy): the backup script writes `<path>/.backup_canary` just before each snapshot, containing `host|path|time` (`hostname -s`, the path, `date --iso-8601=seconds`). For the newest snapshot of each files group, the job reads the canary from the snapshot with `restic dump` (to memory, nothing written to disk) and checks:
+  - present in the snapshot, else **FAIL** (the backup ran but did not capture new files);
+  - `path` matches the group, else **FAIL**;
+  - written 0–15 min (`max_lag`) before the snapshot time, else **FAIL** (stale canary: this snapshot did not capture fresh data; written after the snapshot: clock jump). Both times come from the client's clock, so skew between machines does not matter;
+  - `host` matches the snapshot hostname (short name, case-insensitive), else **WARN**.
+  - DB policies and retired machines are not checked. A canary FAIL blocks deletion for that repo like any other guard.
 - **Deletion cap**: a run may delete at most 20% of a repo's snapshots. `--no-cap` turns this off (for the initial cleanup run).
 - **Repo state**: if the repo is locked, the repo is **SKIPPED**, not FAIL (most likely a backup is running). If `restic check` (without `--read-data`) fails, the repo is **FAIL**.
 
@@ -93,7 +99,7 @@ Checked per repo before any deletion. If a guard fails, the repo is not changed.
 - Exit code: 1 if anything is FAIL or the email failed, otherwise 0.
 - Header line, which becomes the email subject:
   `[restic] FAIL 1 / WARN 0 / SKIPPED 0 / OK 11 (dry-run)`
-- A **Summary** comes first, under the header: "Needs attention" lists every FAIL, WARN and SKIPPED reason as `LEVEL  MACHINE / repo: path: reason` (or "Everything OK."), followed by a one-line tally for each report include. The details follow.
+- A **Summary** comes first, sized for a phone: "Needs attention" lists every FAIL, WARN and SKIPPED finding as one short line, `LEVEL MACHINE[/repo][/path]: short reason` (for example `FAIL POOL/home: missing canary`, `FAIL WEB3/pg-ast/wal: stale 3.5h`), or "Everything OK.", followed by a one-line tally for each report include (`OK DB restore drills: PASS 3, SKIP 1, FAIL 0, 4/4`). The repo label is left out for a machine's main `repo`. The full reasons are in Details.
 - Details, for each repo and each path: the policy matched, how many snapshots were kept and deleted, the oldest and newest kept snapshot with dates, and any failed guard with the reason.
 
 ## Report includes
